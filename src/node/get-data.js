@@ -9,9 +9,11 @@ const Block = require("../core/block");
 const {
   parseJSON,
   numToBuffer,
+  bufferToNum,
   serializeState,
   deserializeState,
 } = require("../utils/utils");
+const Transaction = require("../core/transaction");
 const stateDB = new Level("../../log/stateStore", {
   valueEncoding: "buffer",
 });
@@ -61,14 +63,14 @@ const getBlockDB = async (blockNumber) => {
         const timestamp = deserializedValue.timestamp;
         const parentHash = deserializedValue.parentHash;
         const txRoot = deserializedValue.txRoot;
-        const coinbase = deserializedValue.coinbase;
+        const nodeAddress = deserializedValue.nodeAddress;
         const hash = deserializedValue.hash;
         const block = {
           blockNumber: blockNumber,
           timestamp: timestamp,
           parentHash: parentHash,
           txRoot: txRoot,
-          coinbase: coinbase,
+          nodeAddress: nodeAddress,
           hash: hash,
         };
         resolve(block);
@@ -127,28 +129,106 @@ const main = async () => {
     "fc92f78ca113cf33f174d158300ec832dc4ecad60eaa980ce8f990fa89edca3b";
   const keyPair = ec.keyFromPrivate(privateKey, "hex");
   const publicKey = keyPair.getPublic("hex");
-  const coinbase = SHA256(publicKey);
+  const nodeAddress = SHA256(publicKey);
 
-  // const address =
-  //   "223ce6cd677cca5f5842e63aeb0f3f54a9486a3c5e303c7e5b1fc3dd39cc09c0";
-  // const sDB = await getStateDB(address);
-  // console.log(sDB);
+  // block.blockNumber.toString(),
+  // Buffer.from(Block.serialize(block))
+  // const blockNumber = 2;
+  // for (let i = 1; i <= blockNumber; i++) {
+  //   const bDB = await getBlockDB(i);
+  //   console.log(bDB);
+  // }
+  // let blockData = [];
+  // await blockDB.createReadStream().on("data", function (data) {
+  //   const block = JSON.parse(Block.deserialize(data.value));
+  //   if (block.timestamp && block.timestamp > 5000000) {
+  //     blockData.push(value);
+  //   }
+  // });
+  // console.log(blockData);
+  const filterTimes = Date.now() - 60 * 1000; // 20 seconds
+  // let block = await blockDB.keys().all();
+  // console.log(block);
+  let blockInfo = await blockDB.values().all();
+  blockInfo = blockInfo.map((block) => Block.deserialize(block));
+  console.log(blockInfo);
 
-  const blockNumber = 10;
-  for (let i = 1; i <= blockNumber; i++) {
-    const bDB = await getBlockDB(i);
-    console.log(bDB);
+  const filteredBlock = blockInfo.filter((obj) => {
+    return new Date(obj.timestamp) >= filterTimes;
+  });
+  console.log(filteredBlock);
+
+  const allTransactions = blockInfo.map((block) => block.transactions);
+  // console.log(allTransactions);
+  // const filteredTx = allTransactions.filter((item) =>
+  //   Array.isArray(item) ? item.length > 0 : true
+  // );
+  // console.log(filteredTx);
+  //filter all txs in all blocks to array
+  const flattenTx = allTransactions.flat(); // ???
+  const deserializedTx = flattenTx.map((tx) => Transaction.deserialize(tx));
+  // for (let txIndex = 0; txIndex < blockInfo.transactions.length; txIndex++) {
+  //   const tx = Transaction.deserialize(blockInfo.transactions[txIndex]);
+  //   console.log(tx);
+  // }
+
+  const totalDistance = deserializedTx.reduce((distance, transaction) => {
+    return distance + BigInt(transaction.additionalData.scBody || 0);
+  }, BigInt(0));
+  console.log(`transactions`);
+  // console.log(deserializedTx);
+  console.log("totalDistance: " + totalDistance);
+
+  const senderDistance = deserializedTx.reduce((distance, transaction) => {
+    const senderAddress = SHA256(Transaction.getPubKey(transaction));
+    const scBodyValue = BigInt(transaction.additionalData.scBody);
+
+    if (!distance[senderAddress]) {
+      distance[senderAddress] = scBodyValue;
+    } else {
+      distance[senderAddress] += scBodyValue;
+    }
+
+    return distance;
+  }, {});
+
+  for (const [senderAddress, total] of Object.entries(senderDistance)) {
+    console.log(`senderAddress: ${senderAddress} \nDistance: ${total}`);
   }
-  // const blockHash = 'df58ad88a16af7f7d98a0e6bb7247b30a1e35f585fba0c8cd9e401f5692e10c5'
-  // const bhash = await getbhashDB(blockHash);
-  // console.log(bhash)
-  // const code = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-  // let codeDatabase = {}
-  // codeDatabase = await getCodeDB(code);
-  // console.log(codeDatabase)
+  // console.log("recipientDistance: " + senderDistance);
+
+  console.log(`bhashDB`);
+  // bHash
+  let bHash = await bhashDB.keys().all();
+  console.log(bHash);
+  // numToBuffer
+  let bHashInfo = await bhashDB.values().all();
+  bHashInfo = bHashInfo.map((tx) => bufferToNum(tx));
+  console.log(bHashInfo);
+  console.log(`txhashDB`);
+  // txHash
+  let tx = await txhashDB.keys().all();
+  console.log(tx);
+  // blockNumber.toStrings + " " + block.transactions.txIndex.toStrings
+  let info = await txhashDB.values().all();
+  console.log(info);
+  console.log(`codeDB`);
+  // SHA256(scBody)
+  let code = await codeDB.keys().all();
+  console.log(code);
+  //scBody
+  let codeInfo = await codeDB.values().all();
+  console.log(codeInfo);
+  console.log(`stateDB`);
+  let address = await stateDB.keys().all();
+  console.log(address);
+  let addressInfo = await stateDB.values().all();
+  addressInfo = addressInfo.map((state) => deserializeState(state));
+  console.log(addressInfo);
   let addressAll = await addressDB.keys().all();
   console.log(addressAll);
   let publicAddress = await addressDB.values().all();
+  // console.log(Date.now());
   console.log(publicAddress);
 
   let MY_ADDRESS = "ws://192.168.50.204:10511"; // replace with your actual address

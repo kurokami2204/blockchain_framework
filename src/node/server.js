@@ -11,6 +11,9 @@ const {fork} = require("child_process");
 
 const Block = require("../core/block");
 const Transaction = require("../core/transaction");
+const PreparePool = require("../consensus/preparePool");
+const CommitPool = require("../consensus/commitPool");
+const MessagePool = require("../consensus/messagePool");
 const changeState = require("../core/state");
 const {
   BLOCK_REWARD,
@@ -22,16 +25,19 @@ const {
 const {produceMessage, sendMessage} = require("./message");
 const generateGenesisBlock = require("../core/genesis");
 const {addTransaction, clearDepreciatedTxns} = require("../core/txPool");
-const rpc = require("../rpc/rpc");
+const api = require("../api/api");
 const TYPE = require("./message-types");
-const {verifyBlock, chooseProposer} = require("../consensus/consensus");
+const {
+  verifyBlock,
+  chooseProposer,
+  minApprovals,
+} = require("../consensus/consensus");
 const {
   parseJSON,
   numToBuffer,
   serializeState,
   deserializeState,
 } = require("../utils/utils");
-const jelscript = require("../core/runtime");
 const Merkle = require("../core/merkle");
 const {SyncQueue} = require("./queue");
 const {resolve} = require("path");
@@ -42,11 +48,11 @@ let connectedNodes = 0;
 
 let worker = fork(`${__dirname}/../miner/worker.js`); // Worker thread (for PoW mining).
 
-console.log(worker.events);
+// console.log(worker.events);
 
 let mined = false; // This will be used to inform the node that another node has already mined before it.
 
-// Some chain info cache
+// chain info variable
 const chainInfo = {
   transactionPool: [],
   preparePool: [],
@@ -56,8 +62,12 @@ const chainInfo = {
   syncQueue: new SyncQueue(this),
   syncing: false,
   checkedBlock: {},
-  // difficulty: 1
 };
+const validatorAddress = {};
+let messagePool = [];
+let prepared = false;
+let committed = false;
+let clearMessages = false;
 
 const stateDB = new Level(__dirname + "/../../log/stateStore", {
   valueEncoding: "buffer",
@@ -73,7 +83,7 @@ const codeDB = new Level(__dirname + "/../../log/codeStore");
 const addressDB = new Level(__dirname + "/../../log/addressStore");
 
 // Function to connect to a node.
-async function connect(MY_ADDRESS, address, publicKey) {
+async function connect(MY_ADDRESS, address) {
   if (
     !connected.find((peerAddress) => peerAddress === address) &&
     address !== MY_ADDRESS
@@ -84,12 +94,7 @@ async function connect(MY_ADDRESS, address, publicKey) {
     // Open a connection to the socket.
     socket.on("open", async () => {
       for (const _address of [MY_ADDRESS, ...connected])
-        socket.send(
-          produceMessage(TYPE.HANDSHAKE, {
-            address: _address,
-            publicAddress: publicKey,
-          })
-        );
+        socket.send(produceMessage(TYPE.HANDSHAKE, _address));
       for (const node of opened)
         node.socket.send(produceMessage(TYPE.HANDSHAKE, address));
 
@@ -117,19 +122,14 @@ async function connect(MY_ADDRESS, address, publicKey) {
         socket.on("close", () => {
           opened.splice(connected.indexOf(address), 1);
           connected.splice(connected.indexOf(address), 1);
+          // delete validatorAddress.address;
+          // addressDB.del(address);
 
           console.log(
             `\x1b[32mLOG\x1b[0m [${new Date().toISOString()}] Disconnected from ${address}.`
           );
         });
       }
-    });
-    socket.on("error", async (error) => {
-      console.log(
-        `\x1b[31mERROR\x1b[0m [${new Date().toISOString()}] An error occurred with the socket: ${
-          error.message
-        }`
-      );
     });
   }
 
@@ -139,7 +139,6 @@ async function connect(MY_ADDRESS, address, publicKey) {
 // Function to broadcast a transaction.
 async function sendTransaction(transaction) {
   sendMessage(produceMessage(TYPE.CREATE_TRANSACTION, transaction), opened);
-  // console.log(transaction);
 
   console.log(
     `\x1b[32mLOG\x1b[0m [${new Date().toISOString()}] Sent one transaction.`
@@ -148,7 +147,7 @@ async function sendTransaction(transaction) {
   await addTransaction(transaction, chainInfo, stateDB);
 }
 
-async function proposeBlock(publicKey, ENABLE_LOGGING) {
+async function proposeBlock(publicKey, keyPair, ENABLE_LOGGING) {
   function mine(block) {
     return new Promise((resolve, reject) => {
       worker.addListener("message", (message) => resolve(message.result));
@@ -157,13 +156,12 @@ async function proposeBlock(publicKey, ENABLE_LOGGING) {
     });
   }
 
-  // Block(blockNumber = 1, timestamp = Date.now(), transactions = [], parentHash = "",coinbase = "")
+  // Block(blockNumber = 1, timestamp = Date.now(), transactions = [], parentHash = "",nodeAddress = "")
   // Create a new block.
   const block = new Block(
     chainInfo.latestBlock.blockNumber + 1,
     Date.now(),
     [], // Will add transactions down here
-    // chainInfo.difficulty,
     chainInfo.latestBlock.hash,
     SHA256(publicKey)
   );
@@ -259,12 +257,9 @@ async function proposeBlock(publicKey, ENABLE_LOGGING) {
       states[txSenderAddress].codeHash === EMPTY_HASH &&
       typeof tx.additionalData.scBody === "string"
     ) {
-      states[txSenderAddress].codeHash = SHA256(tx.additionalData.scBody);
+      // states[txSenderAddress].codeHash = SHA256(tx.additionalData.scBody);
       code[states[txSenderAddress].codeHash] = tx.additionalData.scBody;
     }
-
-    // Update nonce
-    // states[txSenderAddress].nonce += 1;
 
     // Decide to drop or add transaction to block
     if (BigInt(states[txSenderAddress].balance) < 0n) {
@@ -276,28 +271,6 @@ async function proposeBlock(publicKey, ENABLE_LOGGING) {
       totalContractGas += BigInt(tx.additionalData.contractGas || 0);
       totalTxGas += BigInt(tx.gas) + BigInt(tx.additionalData.contractGas || 0);
     }
-
-    // Contract execution
-    if (states[tx.recipient].codeHash !== EMPTY_HASH) {
-      const contractInfo = {address: tx.recipient};
-
-      const [newState, newStorage] = await jelscript(
-        code[states[tx.recipient].codeHash],
-        states,
-        BigInt(tx.additionalData.contractGas || 0),
-        stateDB,
-        block,
-        tx,
-        contractInfo,
-        false
-      );
-
-      for (const account of Object.keys(newState)) {
-        states[account] = newState[account];
-
-        storage[tx.recipient] = newStorage;
-      }
-    }
   }
 
   const transactionsAsObj = [...transactionsToMine];
@@ -305,43 +278,22 @@ async function proposeBlock(publicKey, ENABLE_LOGGING) {
   block.transactions = transactionsToMine.map((tx) =>
     Transaction.serialize(tx)
   ); // Add transactions to block
-  block.hash = Block.getHash(block); // Re-hash with new transactions
   block.txRoot = Merkle.buildTxTrie(transactionsAsObj).root; // Re-gen transaction root with new transactions
+  block.hash = Block.getHash(block); // Re-hash with new transactions
 
   // Mine the block.
   mine(block)
     .then(async (block) => {
       // If the block is not mined before, we will add it to our chain and broadcast this new block.
       if (!mined) {
-        // await updateDifficulty(block, chainInfo, blockDB); // Update difficulty
-        // console.log(block)
-
-        await blockDB.put(
-          block.blockNumber.toString(),
-          Buffer.from(Block.serialize(block))
-        ); // Add block to chain
-        await bhashDB.put(block.hash, numToBuffer(block.blockNumber)); // Assign block number to the matching block hash
-
-        // Assign transaction index and block number to transaction hash
-        for (let txIndex = 0; txIndex < block.transactions.length; txIndex++) {
-          const tx = Transaction.deserialize(block.transactions[txIndex]);
-          const txHash = Transaction.getHash(tx);
-
-          await txhashDB.put(
-            txHash,
-            block.blockNumber.toString() + " " + txIndex.toString()
-          );
-        }
-
         chainInfo.latestBlock = block; // Update latest block cache
-        // console.log(chainInfo)
-        // return;
+
         // Reward
         if (
-          !existedAddresses.includes(block.coinbase) &&
-          !states[block.coinbase]
+          !existedAddresses.includes(block.nodeAddress) &&
+          !states[block.nodeAddress]
         ) {
-          states[block.coinbase] = {
+          states[block.nodeAddress] = {
             balance: "0",
             codeHash: EMPTY_HASH,
             storageRoot: EMPTY_HASH,
@@ -350,14 +302,14 @@ async function proposeBlock(publicKey, ENABLE_LOGGING) {
         }
 
         if (
-          existedAddresses.includes(block.coinbase) &&
-          !states[block.coinbase]
+          existedAddresses.includes(block.nodeAddress) &&
+          !states[block.nodeAddress]
         ) {
-          states[block.coinbase] = deserializeState(
-            await stateDB.get(block.coinbase)
+          states[block.nodeAddress] = deserializeState(
+            await stateDB.get(block.nodeAddress)
           );
-          code[states[block.coinbase].codeHash] = await codeDB.get(
-            states[block.coinbase].codeHash
+          code[states[block.nodeAddress].codeHash] = await codeDB.get(
+            states[block.nodeAddress].codeHash
           );
         }
 
@@ -367,8 +319,8 @@ async function proposeBlock(publicKey, ENABLE_LOGGING) {
           gas += BigInt(tx.gas) + BigInt(tx.additionalData.contractGas || 0);
         }
 
-        states[block.coinbase].balance = (
-          BigInt(states[block.coinbase].balance) +
+        states[block.nodeAddress].balance = (
+          BigInt(states[block.nodeAddress].balance) +
           BigInt(BLOCK_REWARD) +
           gas
         ).toString();
@@ -410,28 +362,51 @@ async function proposeBlock(publicKey, ENABLE_LOGGING) {
           stateDB
         );
 
-        sendMessage(
-          produceMessage(
-            TYPE.NEW_BLOCK,
-            Block.serialize(chainInfo.latestBlock)
-          ),
-          opened
-        ); // Broadcast the new block
-        console.log(`Broadcast the new block`);
-        console.log(chainInfo);
-        console.log(
-          `\x1b[32mLOG\x1b[0m [${new Date().toISOString()}] Block #${
-            chainInfo.latestBlock.blockNumber
-          } mined and synced, state transited.`
-        );
+        // Check whether preparePool and commitPool has been clear
+        const intervalCheck = setInterval(function () {
+          if (clearMessages || chainInfo.latestBlock.blockNumber == 2) {
+            prepared = false;
+            committed = false;
+            clearMessages = false;
+
+            // Create prepare messages
+            let prepare = PreparePool.createPrepare(
+              chainInfo.latestBlock,
+              keyPair
+            );
+            chainInfo.preparePool.push(prepare); // Add to the pool
+
+            sendMessage(
+              produceMessage(TYPE.PRE_PREPARE, {
+                newBlock: Block.serialize(chainInfo.latestBlock),
+                prepareMsg: MessagePool.serializeMessage(prepare),
+              }),
+              opened
+            ); // Broadcast the new block
+
+            console.log(
+              `\x1b[32mLOG\x1b[0m [${new Date().toISOString()}] Broadcast pre_prepare message`
+            );
+            console.log(chainInfo);
+            console.log(
+              `\x1b[32mLOG\x1b[0m [${new Date().toISOString()}] Block #${
+                chainInfo.latestBlock.blockNumber
+              } created and broadcasted, state transited.`
+            );
+
+            // Clear intervalCheck
+            clearInterval(intervalCheck);
+          }
+        }, 100);
       } else {
         mined = false;
       }
 
-      // Re-create the worker thread
+      // Stop and Re-create the worker thread
       worker.kill();
-
+      // if (connected.length === 0) {
       worker = fork(`${__dirname}/../miner/worker.js`);
+      // }
     })
     .catch((err) =>
       console.log(
@@ -442,65 +417,166 @@ async function proposeBlock(publicKey, ENABLE_LOGGING) {
 }
 
 // Function to mine continuously
-async function loopPropose(
-  publicKey,
-  MY_ADDRESS,
-  currentSyncBlock,
-  ENABLE_CHAIN_REQUEST,
-  ENABLE_LOGGING,
-  PROPOSE_INTERVAL,
-  time = PROPOSE_INTERVAL
-) {
-  let length = chainInfo.latestBlock.blockNumber;
-  let mining = true;
+async function loopPropose(publicKey, keyPair, ENABLE_LOGGING, chainInfo) {
+  const currentTime = Date.now();
+  const proposeTime = 3000;
+  const nextTriggerTime = Math.ceil(currentTime / proposeTime) * proposeTime;
+  // Sort validatorAddress in variable validatorAddress
+  // let keys = await addressDB.keys().all();
+  // let values = await addressDB.values().all();
+  // let newValidatorAddress = {};
+  // if (keys.length === values.length) {
+  //   keys.forEach((key, index) => {
+  //     newValidatorAddress[key] = values[index];
+  //   });
+  // }
+  // validatorAddress = newValidatorAddress;
 
-  setInterval(async () => {
-    console.log(`length: ` + length);
-    console.log(`mining: ` + mining);
-    console.log(
-      "latestBlock.blockNumber: " + chainInfo.latestBlock.blockNumber
-    );
-    console.log(`loop propose call`);
+  setTimeout(async () => {
+    // console.log(`loop propose call`);
 
-    // Random choose a proposer
-    const proposerAddress = await addressDB.values().all();
-    const validator = await chooseProposer(
-      proposerAddress,
-      chainInfo.latestBlock
-    );
-    console.log(`Proposer address: ` + validator);
-    if (
-      // mining ||
-      // length !== chainInfo.latestBlock.blockNumber ||
-      validator == SHA256(publicKey)
-    ) {
-      // mining = false;
-      // length = chainInfo.latestBlock.blockNumber;
+    // Check transaction before propose block
+    const transactionsToMine = [],
+      states = {},
+      skipped = {};
+    for (const tx of chainInfo.transactionPool) {
+      const txSenderPubkey = Transaction.getPubKey(tx);
+      const txSenderAddress = SHA256(txSenderPubkey);
 
-      await proposeBlock(publicKey, ENABLE_LOGGING);
-      // if (!ENABLE_CHAIN_REQUEST) {
-      //   await proposeBlock(publicKey, ENABLE_LOGGING);
+      if (skipped[txSenderAddress]) continue;
+
+      const totalAmountToPay =
+        BigInt(tx.amount) +
+        BigInt(tx.gas) +
+        BigInt(tx.additionalData.contractGas || 0);
+
+      // Balance check
+      if (!states[txSenderAddress]) {
+        const senderState = deserializeState(
+          await stateDB.get(txSenderAddress)
+        );
+
+        states[txSenderAddress] = senderState;
+        // If sender do not have enough money, skip
+        if (BigInt(senderState.balance) < totalAmountToPay) {
+          skipped[txSenderAddress] = true;
+          continue;
+        }
+        // Calculate after check every transaction
+        states[txSenderAddress].balance = (
+          BigInt(senderState.balance) -
+          BigInt(tx.amount) -
+          BigInt(tx.gas) -
+          BigInt(tx.additionalData.contractGas || 0)
+        ).toString();
+      } else {
+        // If sender do not have enough money, skip
+        if (BigInt(states[txSenderAddress].balance) < totalAmountToPay) {
+          skipped[txSenderAddress] = true;
+          continue;
+        }
+        // Calculate after check every transaction
+        states[txSenderAddress].balance = (
+          BigInt(states[txSenderAddress].balance) -
+          BigInt(tx.amount) -
+          BigInt(tx.gas) -
+          BigInt(tx.additionalData.contractGas || 0)
+        ).toString();
+      }
+
+      // Decide to drop or add transaction to block
+      if (BigInt(states[txSenderAddress].balance) < 0n) {
+        skipped[txSenderAddress] = true;
+        continue;
+      } else {
+        transactionsToMine.push(tx);
+      }
+    }
+
+    if (transactionsToMine.length > 0) {
+      // // Get all block from blockDB
+      // const filterTimes = Date.now() - 20 * 1000; // 20 seconds
+      // let blockInfo = await blockDB.values().all();
+      // blockInfo = blockInfo.map((block) => Block.deserialize(block));
+      // // console.log(blockInfo);
+
+      // // Filtered block from 20s ago
+      // const filteredBlock = blockInfo.filter((obj) => {
+      //   return new Date(obj.timestamp) >= filterTimes;
+      // });
+      // // console.log(filteredBlock);
+
+      // // All txs from filtered block
+      // const allTransactions = filteredBlock.map((block) => block.transactions);
+      // // console.log(allTransactions);
+
+      // //filter all txs in all blocks to array
+      // const flattenTx = allTransactions.flat();
+      // const deserializedTx = flattenTx.map((tx) => Transaction.deserialize(tx));
+
+      // // Get total distance from all filtered transactions
+      // const numberOfMiner = Object.keys(validatorAddress).length;
+
+      // const totalDistance = deserializedTx.reduce((distance, transaction) => {
+      //   return (
+      //     (distance + BigInt(transaction.additionalData.scBody || 0)) /
+      //     numberOfMiner
+      //   );
+      // }, BigInt(0));
+      // // console.log("totalDistance: " + totalDistance);
+
+      // // Get total distance of each sender from all filtered transactions
+      // const senderDistance = deserializedTx.reduce((distance, transaction) => {
+      //   const senderAddress = SHA256(Transaction.getPubKey(transaction));
+      //   const scBodyValue = BigInt(transaction.additionalData.scBody);
+
+      //   if (!distance[senderAddress]) {
+      //     distance[senderAddress] = scBodyValue;
+      //   } else {
+      //     distance[senderAddress] += scBodyValue;
+      //   }
+
+      //   return distance;
+      // }, {});
+
+      // for (const [senderAddress, total] of Object.entries(senderDistance)) {
+      //   // console.log(`senderAddress: ${senderAddress} \nDistance: ${total}`);
+      // }
+      // for (
+      //   let txIndex = 0;
+      //   txIndex < blockInfo.transactions.length;
+      //   txIndex++
+      // ) {
+      //   const tx = Transaction.deserialize(blockInfo.transactions[txIndex]);
       // }
 
-      // } else {
-      //   ENABLE_CHAIN_REQUEST = true;
-      //   await enableChainRequest(
-      //     currentSyncBlock,
-      //     blockDB,
-      //     stateDB,
-      //     MY_ADDRESS
-      //   ).then((newCurrentSyncBlock) => {
-      //     currentSyncBlock = newCurrentSyncBlock;
-      //   });
-
-      console.log("ChainInfo in Loop mine");
-      console.log(chainInfo);
+      // PBFT begin here
+      // Random choose a proposer
+      const validator = await addressDB.values().all();
+      const proposer = await chooseProposer(validator, chainInfo.latestBlock);
+      console.log(
+        `\x1b[32mLOG\x1b[0m [${new Date().toISOString()}] Proposer address: ` +
+          proposer
+      );
+      if (proposer == SHA256(publicKey)) {
+        await proposeBlock(publicKey, keyPair, ENABLE_LOGGING);
+      }
     }
-  }, time);
+  }, nextTriggerTime - currentTime);
 }
 
-async function disableChainRequest(chainInfo) {
-  console.log(`!ENABLE_CHAIN_REQUEST`);
+async function startLoopProposeInterval(
+  publicKey,
+  keyPair,
+  ENABLE_LOGGING,
+  chainInfo
+) {
+  setInterval(async () => {
+    await loopPropose(publicKey, keyPair, ENABLE_LOGGING, chainInfo);
+  }, 3000);
+}
+
+async function disableChainRequest() {
   if ((await blockDB.keys().all()).length === 0) {
     // Initial state
     console.log(chainInfo.latestBlock);
@@ -528,7 +604,7 @@ async function disableChainRequest(chainInfo) {
       `\x1b[32mLOG\x1b[0m [${new Date().toISOString()}] Created Genesis Block with:\n` +
         `    Block number: ${chainInfo.latestBlock.blockNumber.toString()}\n` +
         `    Timestamp: ${chainInfo.latestBlock.timestamp.toString()}\n` +
-        `    Coinbase: ${chainInfo.latestBlock.coinbase.toString()}\n` +
+        `    NodeAddress: ${chainInfo.latestBlock.nodeAddress.toString()}\n` +
         `    Hash: ${chainInfo.latestBlock.hash.toString()}\n` +
         `    TxRoot: ${chainInfo.latestBlock.txRoot.toString()}`
     );
@@ -546,20 +622,26 @@ async function disableChainRequest(chainInfo) {
   }
 }
 
-async function enableChainRequest(currentSyncBlock, MY_ADDRESS) {
+async function enableChainRequest(
+  currentSyncBlock,
+  MY_ADDRESS,
+  nodeAddress,
+  proposeStatus
+) {
   const blockNumbers = await blockDB.keys().all();
-  // const blockNumbers = chainInfo.latestBlock.blockNumber;
 
   // Get the last block in stateDB to synchronize
   if (blockNumbers.length !== 0) {
     currentSyncBlock = Math.max(...blockNumbers.map((key) => parseInt(key)));
     // currentSyncBlock = 1;
   }
-  console.log(`ENABLE_CHAIN_REQUEST`);
+  console.log(
+    `\x1b[32mLOG\x1b[0m [${new Date().toISOString()}] Enable chain request`
+  );
   if (currentSyncBlock === 1) {
     // Lưu trạng thái khởi tạo vào tài khoản FIRST_ACCOUNT trong database stateDB
     await stateDB.put(
-      FIRST_ACCOUNT,
+      nodeAddress,
       Buffer.from(
         serializeState({
           balance: INITIAL_SUPPLY,
@@ -568,27 +650,8 @@ async function enableChainRequest(currentSyncBlock, MY_ADDRESS) {
         })
       )
     );
-
-    // Lưu thông tin Block hiện tại vào bản ghi có key số thứ tự của block (BlockNumber) trong database blockDB
-    // await blockDB.put(chainInfo.latestBlock.blockNumber.toString(), Buffer.from(Block.serialize(chainInfo.latestBlock)));
-
-    // Lưu BlockNumber của block  vào hash của block cuối cùng của chain trong database bhashDB
-    // await bhashDB.put(chainInfo.latestBlock.hash, numToBuffer(chainInfo.latestBlock.blockNumber)); // Assign block number to the matching block hash
-
-    // Update trạng thái của chainInfo, database thay đổi là stateDB và codeDB
-    // await changeState(chainInfo.latestBlock, stateDB, codeDB);
   }
 
-  // if ((await blockDB.keys().all()).length !== 0) {
-  //   chainInfo.latestBlock = Block.deserialize([...(await blockDB.get(Math.max(...(await blockDB.keys().all()).map((key) => parseInt(key))).toString())),]);
-  // }
-  // if (pbft) {
-  //   ENABLE_MINING = true;
-  // } else {
-  //   ENABLE_MINING;
-  // }
-
-  // if (ENABLE_MINING) {
   return new Promise((resolve) => {
     setTimeout(async () => {
       for (const node of opened) {
@@ -596,25 +659,26 @@ async function enableChainRequest(currentSyncBlock, MY_ADDRESS) {
           produceMessage(TYPE.REQUEST_BLOCK, {
             blockNumber: currentSyncBlock,
             requestAddress: MY_ADDRESS,
+            nodeAddress: nodeAddress,
+            proposeStatus: proposeStatus,
           })
         );
       }
       // Resolve the Promise with currentSyncBlock
       resolve(currentSyncBlock);
-    }, 1000);
+    }, 2000);
   });
-  // }
 }
 
 async function startServer(options) {
   const PORT = options.PORT || 3000; // Node's PORT
-  const RPC_PORT = options.RPC_PORT || 5000; // RPC server's PORT
+  const API_PORT = options.API_PORT || 5000; // API server's PORT
   const PEERS = options.PEERS || []; // Peers to connect to
   const MAX_PEERS = options.MAX_PEERS || 10; // Maximum number of peers to connect to
   const MY_ADDRESS = options.MY_ADDRESS || "ws://localhost:3000"; // Node's address
   const ENABLE_MINING = options.ENABLE_MINING ? true : false; // Enable mining?
   const ENABLE_LOGGING = options.ENABLE_LOGGING ? true : false; // Enable logging?
-  const ENABLE_RPC = options.ENABLE_RPC ? true : false; // Enable RPC server?
+  const ENABLE_API = options.ENABLE_API ? true : false; // Enable API server?
   let ENABLE_CHAIN_REQUEST = options.ENABLE_CHAIN_REQUEST ? true : false; // Enable chain sync request?
   const GENESIS_HASH = options.GENESIS_HASH || ""; // Genesis block's hash
   const PROPOSE_INTERVAL = options.PROPOSE_INTERVAL || 5000;
@@ -632,7 +696,10 @@ async function startServer(options) {
 
   await codeDB.put(EMPTY_HASH, "");
   // Lưu địa chỉ node
-  await addressDB.put(MY_ADDRESS, SHA256(publicKey));
+  if (ENABLE_MINING) {
+    validatorAddress[MY_ADDRESS] = SHA256(publicKey);
+    await addressDB.put(MY_ADDRESS, SHA256(publicKey));
+  }
 
   const server = new WS.Server({port: PORT});
 
@@ -650,39 +717,76 @@ async function startServer(options) {
         // Below are handlers for every message types.
 
         case TYPE.HANDSHAKE:
-          const {address, publicAddress} = _message.data;
-          console.log(`Handshake call`);
+          const address = _message.data;
 
           if (connectedNodes <= MAX_PEERS) {
             try {
-              await addressDB.put(address, SHA256(publicAddress));
-              connect(MY_ADDRESS, address, publicKey);
+              connect(MY_ADDRESS, address);
             } catch (e) {
               // Debug console.log(e);
             }
           }
         case TYPE.REQUEST_BLOCK:
-          const {blockNumber, requestAddress} = _message.data;
+          const {blockNumber, requestAddress, nodeAddress, proposeStatus} =
+            _message.data;
+
+          if (blockNumber === undefined) break;
           let requestedBlock;
-          console.log(`Request block call`);
-          console.log(`Block number ${blockNumber}`);
+          // Send node address to join validating request
+          if (
+            proposeStatus &&
+            !validatorAddress.hasOwnProperty("nodeAddress")
+          ) {
+            await addressDB.put(requestAddress, nodeAddress);
+            validatorAddress[requestAddress] = nodeAddress;
+          }
+
+          // Check and add address to the stateDB
+          const existedAddresses = await stateDB.keys().all();
+          if (!existedAddresses.includes(nodeAddress)) {
+            await stateDB.put(
+              nodeAddress,
+              Buffer.from(
+                serializeState({
+                  balance: "0",
+                  codeHash: EMPTY_HASH,
+                  storageRoot: EMPTY_HASH,
+                })
+              )
+            );
+          }
+
+          const socket = opened.find(
+            (node) => node.address === requestAddress
+          ).socket; // Get socket from address
 
           try {
             requestedBlock = [...(await blockDB.get(blockNumber.toString()))]; // Get block
           } catch (err) {
             if (err.notFound) {
+              socket.send(
+                produceMessage(TYPE.SEND_BLOCK, {
+                  responseBlock: requestedBlock,
+                  listNodeAddress: validatorAddress,
+                })
+              ); // Send block
+            } else {
+              // Handle other errors (if needed)
               console.error(
-                `Block number not found in blockDB: ${blockNumber}`
+                "An error occurred while fetching the block:",
+                err.message
               );
             }
             // If block does not exist, break
             break;
           }
 
-          const socket = opened.find(
-            (node) => node.address === requestAddress
-          ).socket; // Get socket from address
-          socket.send(produceMessage(TYPE.SEND_BLOCK, requestedBlock)); // Send block
+          socket.send(
+            produceMessage(TYPE.SEND_BLOCK, {
+              responseBlock: requestedBlock,
+              listNodeAddress: validatorAddress,
+            })
+          ); // Send block
           console.log(
             `\x1b[32mLOG\x1b[0m [${new Date().toISOString()}] Sent block at position ${blockNumber} to ${requestAddress}.`
           );
@@ -690,13 +794,42 @@ async function startServer(options) {
           break;
 
         case TYPE.SEND_BLOCK:
+          const {responseBlock, listNodeAddress} = _message.data;
           let block;
-          console.log(`Send block call`);
+          // Save validatorAddress list
+
+          const addressInState = await stateDB.keys().all();
+          for (let key in listNodeAddress) {
+            if (!validatorAddress.hasOwnProperty(key)) {
+              validatorAddress[key] = listNodeAddress[key];
+              addressDB.put(key, listNodeAddress[key], function (err) {
+                if (err) return console.log("Error saving data:", err);
+              });
+            }
+
+            if (!addressInState.includes(listNodeAddress[key])) {
+              await stateDB.put(
+                validatorAddress[key],
+                Buffer.from(
+                  serializeState({
+                    balance: "0",
+                    codeHash: EMPTY_HASH,
+                    storageRoot: EMPTY_HASH,
+                  })
+                )
+              );
+            }
+          }
+
           try {
-            block = Block.deserialize(_message.data);
+            block = Block.deserialize(responseBlock);
           } catch (error) {
-            console.error(`block fails to be deserialized`);
+            console.error(
+              `\x1b[32mLOG\x1b[0m [${new Date().toISOString()}] Sync chain finish`
+            );
             // If block fails to be deserialized, it's faulty
+            ENABLE_CHAIN_REQUEST = false;
+
             return;
           }
 
@@ -708,8 +841,6 @@ async function startServer(options) {
           // we then check if the genesis block matches with the hash which is safe.
           if (ENABLE_CHAIN_REQUEST && block.blockNumber === currentSyncBlock) {
             const verificationHandler = async function (block) {
-              console.log("Verification call");
-
               if (
                 (chainInfo.latestSyncBlock === null &&
                   (!GENESIS_HASH || GENESIS_HASH === block.hash)) || // For genesis
@@ -723,10 +854,9 @@ async function startServer(options) {
               ) {
                 await blockDB.put(
                   block.blockNumber.toString(),
-                  Buffer.from(_message.data)
+                  Buffer.from(responseBlock)
                 ); // Add block to chain
                 await bhashDB.put(block.hash, numToBuffer(block.blockNumber)); // Assign block number to the matching block hash
-                console.log(chainInfo);
 
                 // Assign transaction index and block number to transaction hash
                 for (
@@ -756,7 +886,7 @@ async function startServer(options) {
                     block.blockNumber
                   }.`
                 );
-                // await updateDifficulty(block, chainInfo, blockDB); // Update difficulty
+
                 chainInfo.syncing = false;
                 chainInfo.syncQueue.wipe(); // Wipe sync queue
                 currentSyncBlock++;
@@ -767,31 +897,14 @@ async function startServer(options) {
                     produceMessage(TYPE.REQUEST_BLOCK, {
                       blockNumber: currentSyncBlock,
                       requestAddress: MY_ADDRESS,
+                      nodeAddress: SHA256(publicKey),
+                      proposeStatus: ENABLE_MINING,
                     })
                   );
                 }
 
                 return true;
               }
-              // else {
-              //   if (!chainInfo.latestSyncBlock) {
-              //     chainInfo.latestSyncBlock = block; // Update latest synced block.
-              //     await changeState(block, stateDB, codeDB, ENABLE_LOGGING); // Force transit state
-              //   }
-
-              //   chainInfo.latestBlock = block; // Update latest block cache
-              //   console.log(`\x1b[32mLOG\x1b[0m [${(new Date()).toISOString()}] Synced block at position ${block.blockNumber}.`);
-              //   // await updateDifficulty(block, chainInfo, blockDB); // Update difficulty
-              //   console.log(`Syncing: ${chainInfo.syncing}`)
-              //   chainInfo.syncing = false;
-              //   chainInfo.syncQueue.wipe(); // Wipe sync queue
-              //   currentSyncBlock++;
-
-              //   // Continue requesting the next block
-              //   for (const node of opened) {
-              //     node.socket.send(produceMessage(TYPE.REQUEST_BLOCK, { blockNumber: currentSyncBlock,requestAddress: MY_ADDRESS,}));
-              //   }
-              // }
 
               return false;
             };
@@ -831,40 +944,34 @@ async function startServer(options) {
 
           // This is pretty much the same as addTransaction, but we will send the transaction to other connected nodes if it's valid.
 
-          // Check nonce
-          // let maxNonce = deserializeState(await stateDB.get(txSenderAddress)).nonce;
+          if (
+            !(await Transaction.compareTx(
+              transaction.signature,
+              chainInfo.transactionPool
+            ))
+          ) {
+            console.log(
+              `\x1b[32mLOG\x1b[0m [${new Date().toISOString()}] New transaction received, broadcasted and added to pool.`
+            );
 
-          // for (const tx of chainInfo.transactionPool) {
-          //     const poolTxSenderPubkey = Transaction.getPubKey(transaction);
-          //     const poolTxSenderAddress = SHA256(poolTxSenderPubkey);
+            chainInfo.transactionPool.push(transaction);
 
-          //     if (poolTxSenderAddress === txSenderAddress && tx.nonce > maxNonce) {
-          //         maxNonce = tx.nonce;
-          //     }
-          // }
-
-          // if (maxNonce + 1 !== transaction.nonce) return;
-
-          console.log(
-            `\x1b[32mLOG\x1b[0m [${new Date().toISOString()}] New transaction received, broadcasted and added to pool.`
-          );
-
-          chainInfo.transactionPool.push(transaction);
-
-          // Broadcast the transaction
-          sendMessage(message, opened);
+            // Broadcast the transaction
+            sendMessage(message, opened);
+          }
 
           break;
 
-        case TYPE.NEW_BLOCK:
-          // "TYPE.NEW_BLOCK" is sent when someone wants to submit a new block.
-          // Its message body must contain the new block and the new difficulty.
+        case TYPE.PRE_PREPARE:
+          // "TYPE.PRE_PREPARE" is sent when someone wants to submit a new block.
+          // Its message body must contain the new block
 
-          let newBlock;
-          console.log("New Block call");
+          let {newBlock, prepareMsg} = _message.data;
+
+          if (!ENABLE_MINING) break;
 
           try {
-            newBlock = Block.deserialize(_message.data);
+            newBlock = Block.deserialize(newBlock);
           } catch (e) {
             // If block fails to be deserialized, it's faulty
             if (e.notFound) {
@@ -872,108 +979,431 @@ async function startServer(options) {
             }
             return;
           }
+          try {
+            prepareMsg = MessagePool.deserializeMessage(prepareMsg);
+          } catch (e) {
+            // If block fails to be deserialized, it's faulty
+            if (e.notFound) {
+              console.error(`prepareMsg error: ${prepareMsg}`);
+            }
+            return;
+          }
+
+          // Checking proposer address
+          let proposerPrePrepare = await addressDB.values().all();
+          if (
+            Block.verifyNodeAddress(
+              newBlock,
+              await chooseProposer(proposerPrePrepare, newBlock)
+            )
+          ) {
+            if (!chainInfo.checkedBlock[newBlock.hash]) {
+              chainInfo.checkedBlock[newBlock.hash] = true;
+            } else {
+              return;
+            }
+
+            if (
+              newBlock.parentHash !== chainInfo.latestBlock.parentHash &&
+              (!ENABLE_CHAIN_REQUEST ||
+                (ENABLE_CHAIN_REQUEST && currentSyncBlock > 1))
+              // Only proceed if syncing is disabled or enabled but already synced at least the genesis block
+            ) {
+              chainInfo.checkedBlock[newBlock.hash] = true;
+
+              console.log("Pre_Prepare call");
+              // Need to check again
+              if (
+                await verifyBlock(
+                  newBlock,
+                  chainInfo,
+                  stateDB,
+                  codeDB,
+                  ENABLE_LOGGING
+                )
+              ) {
+                console.log(
+                  `\x1b[32mLOG\x1b[0m [${new Date().toISOString()}] New block received.`
+                );
+
+                chainInfo.latestBlock = newBlock; // Update latest block to chainInfo variable
+
+                sendMessage(message, opened); // Broadcast block to other nodes
+
+                // Create prepare messages
+                prepared = false;
+                committed = false;
+                clearMessages = false;
+
+                let proposerPrepare = Object.values(validatorAddress);
+
+                if (
+                  !PreparePool.existingPrepare(chainInfo, prepareMsg) &&
+                  PreparePool.isValidPrepare(proposerPrepare, prepareMsg) &&
+                  proposerPrepare.includes(SHA256(prepareMsg.publicKey))
+                ) {
+                  chainInfo.preparePool.push(prepareMsg); // Add to the pool
+
+                  let prepare = PreparePool.createPrepare(
+                    chainInfo.latestBlock,
+                    keyPair
+                  );
+
+                  chainInfo.preparePool.push(prepare); // Add to the pool
+
+                  sendMessage(
+                    produceMessage(
+                      TYPE.PREPARE,
+                      MessagePool.serializeMessage(prepare)
+                    ),
+                    opened
+                  ); // Broadcast prepare message
+                }
+
+                if (ENABLE_CHAIN_REQUEST) {
+                  ENABLE_CHAIN_REQUEST = false;
+                }
+              } else {
+                console.log("false to verify block");
+                console.log(`block.hash`);
+                console.log(
+                  SHA256(
+                    newBlock.blockNumber.toString() +
+                      newBlock.timestamp.toString() +
+                      newBlock.txRoot +
+                      chainInfo.latestBlock.hash
+                  )
+                );
+                console.log(newBlock.hash);
+                console.log(`block.parentHash`);
+                console.log(chainInfo.latestBlock.hash === newBlock.parentHash);
+                console.log(`hasValidTxOrder`);
+                console.log(await Block.hasValidTxOrder(newBlock, stateDB));
+                console.log(`block.txRoot`);
+                console.log(
+                  Merkle.buildTxTrie(newBlock.transactions).root ===
+                    newBlock.txRoot
+                );
+                console.log(`block.timestamp`);
+                console.log(
+                  newBlock.timestamp > chainInfo.latestBlock.timestamp
+                );
+                console.log(newBlock.timestamp < Date.now());
+                console.log(`block.blockNumber`);
+                console.log(
+                  newBlock.blockNumber - 1 === chainInfo.latestBlock.blockNumber
+                );
+                console.log(`hasValidGasLimit`);
+                console.log(Block.hasValidGasLimit(newBlock));
+                console.log(`verifyTransactionAndTransit`);
+                console.log(
+                  await Block.verifyTransactionAndTransit(
+                    newBlock,
+                    stateDB,
+                    codeDB,
+                    ENABLE_LOGGING
+                  )
+                );
+              }
+            } else {
+              // console.log("false to update block");
+              // console.log(`parendHash`);
+              // console.log(newBlock.parentHash);
+              // console.log(chainInfo.latestBlock.parentHash);
+              // console.log(`currentSyncBlock`);
+              // console.log(currentSyncBlock);
+            }
+          } else {
+            console.log("false");
+          }
           // We will only continue checking the block if its parentHash is not the same as the latest block's hash.
           // This is because the block sent to us is likely duplicated or from a node that has lost and should be discarded.
 
-          if (!chainInfo.checkedBlock[newBlock.hash]) {
-            chainInfo.checkedBlock[newBlock.hash] = true;
-          } else {
+          break;
+
+        case TYPE.PREPARE:
+          // "TYPE.PREPARE" is sent when a nodes wants to submit a new prepare message in pbft consensus.
+          // Its message body must contain the prepare message
+          let prepare = _message.data;
+          if (!ENABLE_MINING) break;
+
+          console.log("Prepare call");
+          let proposerPrepare = Object.values(validatorAddress);
+
+          try {
+            prepare = MessagePool.deserializeMessage(prepare);
+          } catch (e) {
+            // If block fails to be deserialized, it's faulty
+            if (e.notFound) {
+              console.error(`prepareMsg error: ${prepare}`);
+            }
             return;
           }
 
           if (
-            newBlock.parentHash !== chainInfo.latestBlock.parentHash &&
-            (!ENABLE_CHAIN_REQUEST ||
-              (ENABLE_CHAIN_REQUEST && currentSyncBlock > 1))
-            // Only proceed if syncing is disabled or enabled but already synced at least the genesis block
+            !prepared &&
+            PreparePool.isValidPrepare(proposerPrepare, prepare) &&
+            proposerPrepare.includes(SHA256(prepare.publicKey))
           ) {
-            chainInfo.checkedBlock[newBlock.hash] = true;
-            // Need to check again
-            if (
-              await verifyBlock(
-                newBlock,
-                chainInfo,
-                stateDB,
-                codeDB,
-                ENABLE_LOGGING
-              )
-            ) {
-              console.log(
-                `\x1b[32mLOG\x1b[0m [${new Date().toISOString()}] New block received.`
+            if (!PreparePool.existingPrepare(chainInfo, prepare)) {
+              // Add prepare message to the pool
+              chainInfo.preparePool.push(prepare);
+
+              // Send to other nodes
+              sendMessage(message, opened);
+            }
+
+            // Minimum requirement
+            let prepareApprovals = await minApprovals(proposerPrepare);
+
+            // If minimum requirement of prepare message reached, send commit message
+            if (chainInfo.preparePool.length >= prepareApprovals) {
+              // Mark as prepared
+              prepared = true;
+              // Create commit messages
+              let commit = CommitPool.createCommit(prepare, keyPair);
+              chainInfo.commitPool.push(commit);
+              sendMessage(
+                produceMessage(
+                  TYPE.COMMIT,
+                  MessagePool.serializeMessage(commit)
+                ),
+                opened
               );
-
-              // If mining is enabled, we will set mined to true, informing that another node has mined before us.
-              if (ENABLE_MINING) {
-                mined = true;
-
-                worker.kill(); // Stop the worker thread
-
-                worker = fork(`${__dirname}/../miner/worker.js`); // Renew
-              }
-
-              // await updateDifficulty(newBlock, chainInfo, blockDB); // Update difficulty
-
-              // console.log(`NEW_BLOCK call ${newBlock.blockNumber}`)
-              await blockDB.put(
-                newBlock.blockNumber.toString(),
-                Buffer.from(_message.data)
-              ); // Add block to chain
-              await bhashDB.put(
-                newBlock.hash,
-                numToBuffer(newBlock.blockNumber)
-              ); // Assign block number to the matching block hash
-
-              // Apply to all txns of the block: Assign transaction index and block number to transaction hash
-              for (
-                let txIndex = 0;
-                txIndex < newBlock.transactions.length;
-                txIndex++
-              ) {
-                const tx = Transaction.deserialize(
-                  newBlock.transactions[txIndex]
-                );
-                const txHash = Transaction.getHash(tx);
-
-                await txhashDB.put(
-                  txHash,
-                  newBlock.blockNumber.toString() + " " + txIndex.toString()
-                );
-              }
-
-              chainInfo.latestBlock = newBlock; // Update latest block cache
-              // chainInfo.latestSyncBlock = newBlock;
-
-              // Update the new transaction pool (remove all the transactions that are no longer valid).
-              chainInfo.transactionPool = await clearDepreciatedTxns(
-                chainInfo,
-                stateDB
-              );
-
-              console.log(
-                `\x1b[32mLOG\x1b[0m [${new Date().toISOString()}] Block #${
-                  newBlock.blockNumber
-                } synced, state transited.`
-              );
-
-              // sendMessage(message, opened); // Broadcast block to other nodes
-              if (ENABLE_CHAIN_REQUEST) {
-                ENABLE_CHAIN_REQUEST = false;
-              }
             }
           }
 
           break;
 
-        case TYPE.PREPARE:
-          break;
         case TYPE.COMMIT:
+          // "TYPE.COMMIT" is sent when a nodes wants to submit a new commit message in pbft consensus.
+          // Its message body must contain the commit message
+          let commit = _message.data;
+
+          if (!ENABLE_MINING) break;
+          console.log("Commit call");
+          let proposerCommit = Object.values(validatorAddress);
+
+          try {
+            commit = MessagePool.deserializeMessage(commit);
+          } catch (e) {
+            // If block fails to be deserialized, it's faulty
+            if (e.notFound) {
+              console.error(`commitMsg error: ${commit}`);
+            }
+            return;
+          }
+
+          if (
+            !committed &&
+            !CommitPool.existingCommit(chainInfo, commit) &&
+            CommitPool.isValidCommit(proposerCommit, commit) &&
+            proposerCommit.includes(SHA256(commit.publicKey))
+          ) {
+            // Add commit message to the pool
+            chainInfo.commitPool.push(commit);
+
+            // Send to other nodes
+            sendMessage(message, opened);
+
+            // Minimum requirement
+            let commitApprovals = await minApprovals(proposerCommit);
+            // If minimum requirement of commit message reached, update block to chain
+            if (chainInfo.commitPool.length >= commitApprovals) {
+              // mark as committed
+              committed = true;
+              // Add block to chain
+              if (
+                !(await blockDB.keys().all()).includes(
+                  chainInfo.latestBlock.blockNumber.toString()
+                )
+              ) {
+                await blockDB.put(
+                  chainInfo.latestBlock.blockNumber.toString(),
+                  Buffer.from(Block.serialize(chainInfo.latestBlock))
+                );
+
+                // Assign block number to the matching block hash
+                await bhashDB.put(
+                  chainInfo.latestBlock.hash,
+                  numToBuffer(chainInfo.latestBlock.blockNumber)
+                );
+
+                // Apply to all txns of the block: Assign transaction index and block number to transaction hash
+                for (
+                  let txIndex = 0;
+                  txIndex < chainInfo.latestBlock.transactions.length;
+                  txIndex++
+                ) {
+                  const tx = Transaction.deserialize(
+                    chainInfo.latestBlock.transactions[txIndex]
+                  );
+                  const txHash = Transaction.getHash(tx);
+
+                  await txhashDB.put(
+                    txHash,
+                    chainInfo.latestBlock.blockNumber.toString() +
+                      " " +
+                      txIndex.toString()
+                  );
+                }
+
+                chainInfo.transactionPool = await clearDepreciatedTxns(
+                  chainInfo,
+                  stateDB
+                );
+
+                console.log(
+                  `\x1b[32mLOG\x1b[0m [${new Date().toISOString()}] Block #${
+                    chainInfo.latestBlock.blockNumber
+                  } synced, state transited.`
+                );
+                console.log(chainInfo);
+              }
+
+              // Create and add message round change to the pool
+              let roundChange = MessagePool.createMessage(
+                chainInfo.latestBlock,
+                keyPair
+              );
+              messagePool.push(roundChange);
+
+              sendMessage(
+                produceMessage(TYPE.ROUND_CHANGE, {
+                  roundChange: MessagePool.serializeMessage(roundChange),
+                  verifiedBlock: Block.serialize(chainInfo.latestBlock),
+                }),
+                opened
+              );
+            }
+          }
+
+          break;
+
+        case TYPE.ROUND_CHANGE:
+          let {roundChange, verifiedBlock} = _message.data;
+
+          let proposerMsg = Object.values(validatorAddress);
+
+          try {
+            roundChange = MessagePool.deserializeMessage(roundChange);
+          } catch (e) {
+            // If block fails to be deserialized, it's faulty
+            if (e.notFound) {
+              console.error(`roundchangeMsg error: ${commit}`);
+            }
+            return;
+          }
+
+          // Validate message
+          if (
+            !MessagePool.existingMessage(messagePool, roundChange) &&
+            MessagePool.isValidMessage(proposerMsg, roundChange) &&
+            proposerMsg.includes(SHA256(roundChange.publicKey))
+          ) {
+            if (!ENABLE_MINING) {
+              try {
+                verifiedBlock = Block.deserialize(verifiedBlock);
+              } catch (e) {
+                // If block fails to be deserialized, it's faulty
+
+                return;
+              }
+              if (!chainInfo.checkedBlock[verifiedBlock.hash]) {
+                chainInfo.checkedBlock[verifiedBlock.hash] = true;
+              } else {
+                return;
+              }
+
+              if (
+                verifiedBlock.parentHash !== chainInfo.latestBlock.parentHash &&
+                (!ENABLE_CHAIN_REQUEST ||
+                  (ENABLE_CHAIN_REQUEST && currentSyncBlock > 1))
+                // Only proceed if syncing is disabled or enabled but already synced at least the genesis block
+              ) {
+                chainInfo.checkedBlock[verifiedBlock.hash] = true;
+                // Need to check again
+                if (
+                  await verifyBlock(
+                    verifiedBlock,
+                    chainInfo,
+                    stateDB,
+                    codeDB,
+                    ENABLE_LOGGING
+                  )
+                ) {
+                  console.log(
+                    `\x1b[32mLOG\x1b[0m [${new Date().toISOString()}] New block received.`
+                  );
+                  // Add block to the chain for disable mining nodes
+                  await blockDB.put(
+                    verifiedBlock.blockNumber.toString(),
+                    Buffer.from(Block.serialize(verifiedBlock))
+                  ); // Add block to chain
+
+                  await bhashDB.put(
+                    verifiedBlock.hash,
+                    numToBuffer(verifiedBlock.blockNumber)
+                  ); // Assign block number to the matching block hash
+
+                  // Apply to all txns of the block: Assign transaction index and block number to transaction hash
+                  for (
+                    let txIndex = 0;
+                    txIndex < verifiedBlock.transactions.length;
+                    txIndex++
+                  ) {
+                    const tx = Transaction.deserialize(
+                      verifiedBlock.transactions[txIndex]
+                    );
+                    const txHash = Transaction.getHash(tx);
+                    await txhashDB.put(
+                      txHash,
+                      verifiedBlock.blockNumber.toString() +
+                        " " +
+                        txIndex.toString()
+                    );
+                  }
+
+                  chainInfo.latestBlock = verifiedBlock; // Update latest block variable
+
+                  // Update the new transaction pool (remove all the transactions that are no longer valid).
+                  chainInfo.transactionPool = await clearDepreciatedTxns(
+                    chainInfo,
+                    stateDB
+                  );
+
+                  console.log(
+                    `\x1b[32mLOG\x1b[0m [${new Date().toISOString()}] Block #${
+                      verifiedBlock.blockNumber
+                    } synced, state transited.`
+                  );
+                }
+              }
+            } else {
+              if (!clearMessages) {
+                console.log(`Round change`);
+                //Add message to the pool
+                messagePool.push(roundChange);
+
+                // Clear prepare pool and commit pool
+                PreparePool.clearPreparePool(chainInfo);
+                CommitPool.clearCommitPool(chainInfo);
+                clearMessages = true;
+
+                // Send to other nodes
+                sendMessage(message, opened);
+
+                messagePool.splice(0, messagePool.length);
+              }
+            }
+          }
           break;
       }
     });
   });
 
   try {
-    PEERS.forEach(async (peer) => await connect(MY_ADDRESS, peer, publicKey)); // Connect to peers
+    PEERS.forEach(async (peer) => await connect(MY_ADDRESS, peer)); // Connect to peers
   } catch (e) {}
 
   // If node is a proposer
@@ -984,40 +1414,26 @@ async function startServer(options) {
   let currentSyncBlock = 1;
 
   if (ENABLE_CHAIN_REQUEST) {
-    await enableChainRequest(currentSyncBlock, MY_ADDRESS).then(
-      (newCurrentSyncBlock) => {
-        currentSyncBlock = newCurrentSyncBlock;
-      }
-    );
+    await enableChainRequest(
+      currentSyncBlock,
+      MY_ADDRESS,
+      SHA256(publicKey),
+      ENABLE_MINING
+    ).then((newCurrentSyncBlock) => {
+      currentSyncBlock = newCurrentSyncBlock;
+    });
   }
-  // Transaction(recipient = "", amount = "0", gas = "1000000000000", additionalData = {}) {
-  // const transactionNew = new Transaction("04042809485ba7ee059057d2f1eedb5a1f5f208e15f775c17ffd0bd744df0dd2a285b52859ac708ee7ee9d43f61c3eb2a498527121f2b22a5b4ce17b84ccdb6bd3", 30, 20, {contractGas: 2})
-  // Transaction.sign(transactionNew, keyPair)
-  // await sendTransaction(transactionNew)
-
-  // const transaction1 = new Transaction("04324ae590b69c924fce7383f777c62868ce8a5deb23df58adb882f1c8d4e9cfa77e57a8a72832213bfbc6b641f42c492b638ae723e894db0463ddb3c8595f234b", 300, 200, {contractGas: 20})
-  // Transaction.sign(transaction1, keyPair)
-  // await sendTransaction(transaction1)
-
-  // const myContract = ``;
-  // const transaction = new Transaction("contract address", amount, gas, {
-  //   scBody: myContract
-  // });
-  // Transaction.sign(transaction, keyPair);
-  // sendTransaction(transaction);
 
   if (ENABLE_MINING)
-    loopPropose(
+    await startLoopProposeInterval(
       publicKey,
-      MY_ADDRESS,
-      currentSyncBlock,
-      ENABLE_CHAIN_REQUEST,
+      keyPair,
       ENABLE_LOGGING,
-      PROPOSE_INTERVAL
+      chainInfo
     );
-  if (ENABLE_RPC)
-    rpc(
-      RPC_PORT,
+  if (ENABLE_API)
+    api(
+      API_PORT,
       {publicKey, mining: ENABLE_MINING, chainInfo},
       sendTransaction,
       keyPair,

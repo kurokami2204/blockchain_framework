@@ -47,6 +47,11 @@ function numToBuffer(value) {
   return Buffer.from(hexValue.padStart(hexLength, "0"), "hex");
 }
 
+function bufferToNum(buffer) {
+  const hexValue = buffer.toString("hex");
+  return parseInt(hexValue, 16);
+}
+
 function serializeState(stateHeader) {
   let hexState = "";
 
@@ -75,6 +80,22 @@ function deserializeState(stateInBytes) {
   return stateHeader;
 }
 
+// PBFT sign messages utilities
+function getPubKey(keyPair) {
+  return keyPair.getPublic("hex");
+}
+
+function signMessage(keyPair, dataHash) {
+  const sigObj = keyPair.sign(dataHash);
+  let signature = {};
+
+  return (signature = {
+    v: sigObj.recoveryParam.toString(16), // Tham số khôi phục của ECDSA
+    r: sigObj.r.toString(16), // Tọa độ x của điểm kết quả trong ESDCA
+    s: sigObj.s.toString(16), // Giá trị của chữ ký ESDCA
+  });
+}
+
 module.exports = {
   log16,
   isNumber,
@@ -82,6 +103,9 @@ module.exports = {
   parseJSON,
   bigIntable,
   numToBuffer,
+  bufferToNum,
   serializeState,
   deserializeState,
+  getPubKey,
+  signMessage,
 };

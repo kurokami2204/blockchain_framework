@@ -1,17 +1,16 @@
 "use strict";
 
-const { Level } = require("level");
+const {Level} = require("level");
 const crypto = require("crypto"),
   SHA256 = (message) =>
     crypto.createHash("sha256").update(message).digest("hex");
 const EC = require("elliptic").ec,
   ec = new EC("secp256k1");
-const { PRIVATE_KEY } = require("../../config.json");
+
 const Transaction = require("./transaction");
 const Merkle = require("./merkle");
-const { BLOCK_REWARD, BLOCK_GAS_LIMIT, EMPTY_HASH } = require("../config.json");
-const jelscript = require("./runtime");
-const { serializeState, deserializeState } = require("../utils/utils");
+const {BLOCK_REWARD, BLOCK_GAS_LIMIT, EMPTY_HASH} = require("../config.json");
+const {serializeState, deserializeState} = require("../utils/utils");
 
 class Block {
   constructor(
@@ -19,7 +18,7 @@ class Block {
     timestamp = Date.now(),
     transactions = [],
     parentHash = "",
-    coinbase = ""
+    nodeAddress = ""
   ) {
     this.transactions = transactions; // Transaction list
 
@@ -27,7 +26,7 @@ class Block {
     this.blockNumber = blockNumber; // Block's index in chain
     this.timestamp = timestamp; // Block creation timestamp
     this.parentHash = parentHash; // Parent (previous) block's hash
-    this.coinbase = coinbase; // Address to receive reward
+    this.nodeAddress = nodeAddress; // Address to receive reward
     this.hash = Block.getHash(this); // Hash of the block
     // Merkle root of transactions
     this.txRoot = Merkle.buildTxTrie(
@@ -43,7 +42,7 @@ class Block {
     // - Timestamp: 6 bytes | Int
     // - Parent hash: 32 bytes | Hex string
     // - Tx root: 32 bytes | Hex string
-    // - Coinbase: 32 bytes | Hex string
+    // - nodeAddress: 32 bytes | Hex string
     // - Hash: 32 bytes | Hex string
     // - Transactions: What's left, for each transaction we do:
     //   - Offset: 4 bytes | Int
@@ -57,12 +56,12 @@ class Block {
     blockHexStr += inputBlock.timestamp.toString(16).padStart(12, "0");
     // Parent hash
     blockHexStr += inputBlock.parentHash.toString(16).padStart(64, "0");
-    // Tx root
-    blockHexStr += inputBlock.txRoot.toString(16).padStart(64, "0");
-    // Coinbase & proposer
-    blockHexStr += inputBlock.coinbase.toString(16).padStart(64, "0");
+    // nodeAddress & proposer
+    blockHexStr += inputBlock.nodeAddress.toString(16).padStart(64, "0");
     // Hash
     blockHexStr += inputBlock.hash.toString(16).padStart(64, "0");
+    // Tx root
+    blockHexStr += inputBlock.txRoot.toString(16).padStart(64, "0");
 
     // Transactions
     for (const tx of inputBlock.transactions) {
@@ -80,7 +79,7 @@ class Block {
   static deserialize(block) {
     let blockHexStr = Buffer.from(block).toString("hex");
 
-    const myBlock = { transactions: [] };
+    const myBlock = {transactions: []};
 
     // Block number
     myBlock.blockNumber = parseInt(blockHexStr.slice(0, 8), 16);
@@ -94,16 +93,16 @@ class Block {
     (myBlock.parentHash = blockHexStr.slice(0, 64)), 16;
     blockHexStr = blockHexStr.slice(64);
 
-    // Tx root
-    myBlock.txRoot = blockHexStr.slice(0, 64);
-    blockHexStr = blockHexStr.slice(64);
-
-    // Coinbase & proposer
-    myBlock.coinbase = blockHexStr.slice(0, 64);
+    // nodeAddress & proposer
+    myBlock.nodeAddress = blockHexStr.slice(0, 64);
     blockHexStr = blockHexStr.slice(64);
 
     // Hash
     myBlock.hash = blockHexStr.slice(0, 64);
+    blockHexStr = blockHexStr.slice(64);
+
+    // Tx root
+    myBlock.txRoot = blockHexStr.slice(0, 64);
     blockHexStr = blockHexStr.slice(64);
 
     // Transaction
@@ -127,14 +126,6 @@ class Block {
   // Băm dữ liệu block ra mã băm
   static getHash(block) {
     // Convert every piece of data to string, merge and then hash
-    // return SHA256(
-    //     block.blockNumber.toString()       +
-    //     block.timestamp.toString()         +
-    //     block.txRoot                       +
-    //     block.difficulty.toString()        +
-    //     block.parentHash                   +
-    //     block.nonce.toString()
-    // );
     return SHA256(
       block.blockNumber.toString() +
         block.timestamp.toString() +
@@ -143,15 +134,8 @@ class Block {
     );
   }
 
-  // Get proposer address
-  static getCoinbase(PRIVATE_KEY) {
-    const keyPair = ec.keyFromPrivate(PRIVATE_KEY, "hex");
-
-    return SHA256(keyPair.getPublic("hex"));
-  }
-
-  static async verifyCoinbase(block, coinbase) {
-    return block.coinbase == coinbase ? true : false;
+  static async verifyNodeAddress(block, nodeAddress) {
+    return block.nodeAddress == nodeAddress ? true : false;
   }
 
   static async verifyTransactionAndTransit(
@@ -211,13 +195,13 @@ class Block {
         ).toString();
       } else {
         if (
-          states[txSenderAddress].codeHash !== EMPTY_HASH ||
-          BigInt(states[txSenderAddress].balance) < totalAmountToPay
+          states[transactionSenderAddress].codeHash !== EMPTY_HASH ||
+          BigInt(states[transactionSenderAddress].balance) < totalAmountToPay
         )
           return false;
 
-        states[txSenderAddress].balance = (
-          BigInt(states[txSenderAddress].balance) - totalAmountToPay
+        states[transactionSenderAddress].balance = (
+          BigInt(states[transactionSenderAddress].balance) - totalAmountToPay
         ).toString();
       }
 
@@ -226,15 +210,12 @@ class Block {
         states[transactionSenderAddress].codeHash === EMPTY_HASH &&
         typeof tx.additionalData.scBody === "string"
       ) {
-        states[transactionSenderAddress].codeHash = SHA256(
-          tx.additionalData.scBody
-        );
+        // states[transactionSenderAddress].codeHash = SHA256(
+        //   tx.additionalData.scBody
+        // );
         code[states[transactionSenderAddress].codeHash] =
           tx.additionalData.scBody;
       }
-
-      // Update nonce
-      // states[transactionSenderAddress].nonce += 1;
 
       if (BigInt(states[transactionSenderAddress].balance) < 0n) return false;
 
@@ -260,38 +241,16 @@ class Block {
       states[tx.recipient].balance = (
         BigInt(states[tx.recipient].balance) + BigInt(tx.amount)
       ).toString();
-
-      // Contract execution
-      if (states[tx.recipient].codeHash !== EMPTY_HASH) {
-        const contractInfo = { address: tx.recipient };
-
-        const [newState, newStorage] = await jelscript(
-          code[states[tx.recipient].codeHash],
-          states,
-          BigInt(tx.additionalData.contractGas || 0),
-          stateDB,
-          myBlock,
-          tx,
-          contractInfo,
-          enableLogging
-        );
-
-        for (const account of Object.keys(newState)) {
-          states[account] = newState[account];
-        }
-
-        storage[tx.recipient] = newStorage;
-      }
     }
 
     // Reward
 
     if (
-      !existedAddresses.includes(myBlock.coinbase) &&
-      !states[myBlock.coinbase]
+      !existedAddresses.includes(myBlock.nodeAddress) &&
+      !states[myBlock.nodeAddress]
     ) {
-      // states[myBlock.coinbase] = { balance: "0", codeHash: EMPTY_HASH, nonce: 0, storageRoot: EMPTY_HASH }
-      states[myBlock.coinbase] = {
+      // states[myBlock.nodeAddress] = { balance: "0", codeHash: EMPTY_HASH, nonce: 0, storageRoot: EMPTY_HASH }
+      states[myBlock.nodeAddress] = {
         balance: "0",
         codeHash: EMPTY_HASH,
         storageRoot: EMPTY_HASH,
@@ -300,14 +259,14 @@ class Block {
     }
 
     if (
-      existedAddresses.includes(myBlock.coinbase) &&
-      !states[myBlock.coinbase]
+      existedAddresses.includes(myBlock.nodeAddress) &&
+      !states[myBlock.nodeAddress]
     ) {
-      states[myBlock.coinbase] = deserializeState(
-        await stateDB.get(myBlock.coinbase)
+      states[myBlock.nodeAddress] = deserializeState(
+        await stateDB.get(myBlock.nodeAddress)
       );
-      code[states[myBlock.coinbase].codeHash] = await codeDB.get(
-        states[myBlock.coinbase].codeHash
+      code[states[myBlock.nodeAddress].codeHash] = await codeDB.get(
+        states[myBlock.nodeAddress].codeHash
       );
     }
 
@@ -317,8 +276,8 @@ class Block {
       gas += BigInt(tx.gas) + BigInt(tx.additionalData.contractGas || 0);
     }
 
-    states[myBlock.coinbase].balance = (
-      BigInt(states[myBlock.coinbase].balance) +
+    states[myBlock.nodeAddress].balance = (
+      BigInt(states[myBlock.nodeAddress].balance) +
       BigInt(BLOCK_REWARD) +
       gas
     ).toString();
@@ -369,23 +328,6 @@ class Block {
       // If a transaction fails to be deserialized, the block is faulty
       return false;
     }
-
-    // const nonces = {};
-
-    // for (const tx of block.transactions) {
-    //     const txSenderPubkey = Transaction.getPubKey(tx);
-    //     const txSenderAddress = SHA256(txSenderPubkey);
-
-    //     if (typeof nonces[txSenderAddress] === "undefined") {
-    //         const senderState = deserializeState(await stateDB.get(txSenderAddress));
-
-    //         nonces[txSenderAddress] = senderState.nonce;
-    //     }
-
-    //     if (nonces[txSenderAddress] + 1 !== tx.nonce) return false;
-
-    //     nonces[txSenderAddress]++;
-    // }
 
     return true;
   }

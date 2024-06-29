@@ -1,64 +1,82 @@
-const crypto = require("crypto"), SHA256 = message => crypto.createHash("sha256").update(message).digest("hex");
-const EC = require("elliptic").ec, ec = new EC("secp256k1");
-const Transaction = require("../core/transaction");
-const Block = require("../core/block");
+const crypto = require("crypto"),
+  SHA256 = (message) =>
+    crypto.createHash("sha256").update(message).digest("hex");
+const EC = require("elliptic").ec,
+  ec = new EC("secp256k1");
+const BN = require("bn.js");
+const {getPubKey, signMessage} = require("../utils/utils");
 
 class PreparePool {
-    // Danh sách của chứa thông điệp prepare cho hash của block
-    constructor() {
-        this.list = {};
+  // Danh sách của chứa thông điệp prepare cho hash của block
+  constructor() {
+    this.list = [];
+  }
+
+  // tạo thông điệp prepare cho block gửi đến
+  static createPrepare(block, keyPair) {
+    let prepare = {
+      blockHash: block.hash,
+      publicKey: getPubKey(keyPair),
+      signature: signMessage(keyPair, block.hash),
+    };
+    return prepare;
+  }
+
+  // đẩy thông điệp prepare cho một block hash vào list
+  static addPrepare(chainInfo, prepare) {
+    this.list = chainInfo.preparePool;
+    this.list.push(prepare);
+  }
+
+  // check nếu thông điệp prepare đã tồn tại
+  static existingPrepare(chainInfo, prepare) {
+    let exists = chainInfo.preparePool.find(
+      (p) => p.publicKey === prepare.publicKey
+    );
+    return exists;
+  }
+
+  // validate thông điệp prepare
+
+  static isValidPrepare(validatorAddress, prepare) {
+    const msgHash = prepare.blockHash;
+
+    const sigObj = {
+      r: new BN(prepare.signature.r, 16),
+      s: new BN(prepare.signature.s, 16),
+      recoveryParam: parseInt(prepare.signature.v, 16),
+    };
+
+    const preparePublicKey = ec.recoverPubKey(
+      new BN(msgHash, 16).toString(10),
+      sigObj,
+      sigObj.recoveryParam
+    );
+
+    const publicKey = ec.keyFromPublic(preparePublicKey).getPublic("hex");
+    // Check recover public key exist in address pool
+    if (!validatorAddress.includes(SHA256(publicKey))) {
+      return false;
+    }
+    // Verify message hash sign by signature
+    if (
+      !ec
+        .keyFromPublic(preparePublicKey)
+        .verify(prepare.blockHash, prepare.signature)
+    ) {
+      return false;
     }
 
-    // prepare khởi tạo một danh sách các thông điệp prepare của một block
-    // gắn thông điệp prepare cho từng node hiện tại và trả lại 
-    prepare(block, transaction) {
-        let prepare = this.createPrepare(block, transaction);
-        this.list[block.hash] = [];
-        this.list[block.hash].push(prepare);
-        return prepare;
-    }
+    return true;
+  }
 
-    // tạo thông điệp prepare cho block
-    createPrepare(block, transaction) {
-        let prepare = {
-            blockHash: block.hash,
-            publicKey: transaction.getPubKey(tx),
-            signature: transaction.sign(tx, keyPair) // ???
-        };
+  static clearPreparePool(chainInfo) {
+    const preparePool = chainInfo.preparePool;
 
-        return prepare;
-    }
+    preparePool.splice(0, preparePool.length);
 
-    // đẩy thông điệp prepare cho một block hash vào list
-    addPrepare(prepare) {
-        this.list[prepare.blockHash].push(prepare);
-    }
-
-    // check nếu thông điệp prepare đã tồn tại
-    existingPrepare(prepare) {
-        let exists = this.list[prepare.blockHash].find(
-            p => p.publicKey === prepare.publicKey
-        );
-        return exists;
-    }
-
-    // validate thông điệp prepare
-    isValidPrepare(prepare) {
-        return ec.keyFromPublic(prepare.publicKey)
-            .verify(prepare.signature, prepare.blockHash);
-    }
-
-    clearPreparePool(chainInfo, prepare) {
-        const preparePool = chainInfo.preparePool;
-
-        const newPreparePool = [];
-        // let skipped = {};
-
-        for (const prepareMessage of preparePool) {
-        }
-
-        return newPreparePool;
-    }
+    return preparePool;
+  }
 }
 
 module.exports = PreparePool;

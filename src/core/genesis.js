@@ -11,7 +11,7 @@ const Transaction = require("./transaction");
 const {FIRST_ACCOUNT} = require("../config.json");
 
 function generateGenesisBlock() {
-  // Block(blockNumber = 1, timestamp = Date.now(), transactions = [], parentHash = "",coinbase = "")
+  // Block(blockNumber = 1, timestamp = Date.now(), transactions = [], parentHash = "",nodeAddress = "")
   return new Block(
     1,
     Date.now(),

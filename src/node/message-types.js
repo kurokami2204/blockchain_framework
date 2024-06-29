@@ -3,9 +3,10 @@ const TYPE = {
   REQUEST_BLOCK: 1,
   SEND_BLOCK: 2,
   CREATE_TRANSACTION: 3,
-  NEW_BLOCK: 4,
+  PRE_PREPARE: 4,
   PREPARE: 5,
   COMMIT: 6,
+  ROUND_CHANGE: 7,
 };
 
 module.exports = TYPE;

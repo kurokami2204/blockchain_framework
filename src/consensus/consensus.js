@@ -2,9 +2,8 @@ const crypto = require("crypto"),
   SHA256 = (message) =>
     crypto.createHash("sha256").update(message).digest("hex");
 const Block = require("../core/block");
-const { log16 } = require("../utils/utils");
+const {log16} = require("../utils/utils");
 const Merkle = require("../core/merkle");
-const { BLOCK_TIME } = require("../config.json");
 
 async function verifyBlock(
   newBlock,
@@ -30,22 +29,9 @@ async function verifyBlock(
         newBlock.timestamp.toString() +
         newBlock.txRoot +
         chainInfo.latestBlock.hash
-      // newBlock.difficulty.toString()        +
-      // chainInfo.latestBlock.hash            +
-      // newBlock.nonce.to String() =>
-
-      // Difficulty = 0x000000000000000000000000000012
-      // Nếu 10 phút chưa có ai đào được, 27
-      // if( NumOfZero(Hash(nonce) >= 1000))  0 - 7, 0 - 199
-      // Phí giao dịch, transaction có 0.2 coin
-      // Được phép lấy các transaction từ
     ) === newBlock.hash &&
     // Check parent hash
     chainInfo.latestBlock.hash === newBlock.parentHash &&
-    // Check proof of work
-    // newBlock.hash.startsWith("00000" + Array(Math.floor(log16(chainInfo.difficulty)) + 1).join("0")) &&
-    // newBlock.difficulty === chainInfo.difficulty &&
-
     // Check transactions ordering
     (await Block.hasValidTxOrder(newBlock, stateDB)) &&
     // Check transaction trie root
@@ -55,8 +41,6 @@ async function verifyBlock(
     newBlock.timestamp < Date.now() &&
     // Check block number
     newBlock.blockNumber - 1 === chainInfo.latestBlock.blockNumber &&
-    // // Check proposer
-    // (await Block.verifyProposer(newBlock)) &&
     // Check gas limit
     Block.hasValidGasLimit(newBlock) &&
     // Check transactions and transit state right after
@@ -75,13 +59,12 @@ async function chooseProposer(validatorList, newBlock) {
   return validatorList[viewIndex];
 }
 
-// async function updateDifficulty(newBlock, chainInfo, blockDB) {
-//     if (newBlock.blockNumber % 100 === 0) {
-//         const oldBlock = Block.deserialize([...await blockDB.get((newBlock.blockNumber - 99).toString())]);
+async function minApprovals(address) {
+  // PBFT consensus
+  // N is the number of nodes require for f faulty
+  // N = 3 * f + 1
+  // Minimal approval for pbft consensus = 2 * f + 1
+  return 2 * ((address.length - 1) / 3) + 1;
+}
 
-//         chainInfo.difficulty = Math.ceil(chainInfo.difficulty * 100 * BLOCK_TIME / (newBlock.timestamp - oldBlock.timestamp));
-//     }
-// }
-
-// module.exports = { verifyBlock, updateDifficulty };
-module.exports = { verifyBlock, chooseProposer };
+module.exports = {verifyBlock, chooseProposer, minApprovals};
